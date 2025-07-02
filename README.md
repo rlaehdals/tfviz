@@ -47,6 +47,8 @@ In your Terraform project directory:
 tfviz plan
 ```
 
-This will start a temporary local web server and automatically open your default browser to show the visualized plan.
+This will start a temporary local web server and automatically open your default browser to show the visualized plan.  
+
 No HTML file is written to disk — everything runs in memory.
-Once you close the browser or exit the page, the server automatically shuts down.
+  
+The server automatically shuts down **5 seconds after the page has been opened**, regardless of whether the browser is still open or not.
