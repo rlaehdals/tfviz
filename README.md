@@ -4,7 +4,7 @@ Reading a large `terraform plan` output in JSON can be overwhelming, especially 
 **`tfviz`** is a simple CLI tool that takes `terraform show -json` output and generates a clean, visual HTML report.  
 It summarizes key statistics and shows changes grouped by module and resource, making it easier to understand and share with your team.
 
-<img width="1179" alt="Image" src="https://github.com/user-attachments/assets/4cd6713d-32d7-4d89-a039-668ceba9533f" />
+<img width="1237" height="771" alt="Image" src="https://github.com/user-attachments/assets/b934bb96-07c9-4fdc-b1ac-d42271a42fc3" />
 
 ## ⚙️ Requirements
 
