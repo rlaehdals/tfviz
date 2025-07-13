@@ -82,6 +82,11 @@ type ModuleSummary struct {
 	ResourceTypes map[string]int `json:"resource_types"`
 }
 
+type DiffLine struct {
+	Type string
+	Text string
+}
+
 type ResourceAnalysis struct {
 	Address     string         `json:"address"`
 	Type        string         `json:"type"`
@@ -91,9 +96,8 @@ type ResourceAnalysis struct {
 	Changes     []ChangeDetail `json:"changes,omitempty"`
 	Impact      string         `json:"impact"`
 	Description string         `json:"description"`
-	BeforeJSON  template.HTML  `json:"before_json"`
-	AfterJSON   template.HTML  `json:"after_json"`
-	DiffText    template.HTML  `json:"diff_text"`
+	DiffLines   []DiffLine     `json:"diff_lines"`
+	PolicyDocumentJSON string         `json:"policy_document_json,omitempty"`
 }
 
 type ChangeDetail struct {
@@ -145,14 +149,14 @@ func handlePlan(args []string) {
 
 	fmt.Println("📄 Extracting JSON from plan...")
 	showCmd := exec.Command("terraform", "show", "-json", planBinaryFile)
-	output, err := showCmd.Output()
+	out, err := showCmd.Output()
 	if err != nil {
 		fmt.Printf("❌ Error running terraform show: %v\n", err)
 		os.Exit(1)
 	}
 
 	var plan TerraformPlan
-	err = json.Unmarshal(output, &plan)
+	err = json.Unmarshal(out, &plan)
 	if err != nil {
 		fmt.Printf("❌ Error parsing JSON plan: %v\n", err)
 		os.Exit(1)
@@ -277,11 +281,36 @@ func analyzePlan(plan TerraformPlan) AnalyzedPlan {
 			Description: generateDescription(action, rc.Type, rc.Name),
 		}
 
+		// Check for policy documents and pretty-print them
+		if policyVal, ok := rc.Change.After["policy"]; ok {
+			if policyStr, isString := policyVal.(string); isString {
+				var parsedPolicy interface{}
+				err := json.Unmarshal([]byte(policyStr), &parsedPolicy)
+				if err == nil {
+					prettyPolicy, err := json.MarshalIndent(parsedPolicy, "", "  ")
+					if err == nil {
+						res.PolicyDocumentJSON = string(prettyPolicy)
+					}
+				}
+			}
+		}
+		if assumeRolePolicyVal, ok := rc.Change.After["assume_role_policy"]; ok {
+			if assumeRolePolicyStr, isString := assumeRolePolicyVal.(string); isString {
+				var parsedAssumeRolePolicy interface{}
+				err := json.Unmarshal([]byte(assumeRolePolicyStr), &parsedAssumeRolePolicy)
+				if err == nil {
+					prettyAssumeRolePolicy, err := json.MarshalIndent(parsedAssumeRolePolicy, "", "  ")
+					if err == nil {
+						res.PolicyDocumentJSON = string(prettyAssumeRolePolicy)
+					}
+				}
+			}
+		}
+
 		res.Changes = analyzeChanges(rc.Change.Before, rc.Change.After)
 
 		isReplace := len(rc.Change.Actions) == 2 && rc.Change.Actions[0] == "delete" && rc.Change.Actions[1] == "create"
-		diffStr := generateTerraformStyleDiff(rc.Change.Before, rc.Change.After, rc.Change.AfterUnknown, isReplace)
-		res.DiffText = template.HTML(fmt.Sprintf("<pre>%s</pre>", template.HTMLEscapeString(diffStr)))
+		res.DiffLines = generateTerraformStyleDiff(rc, isReplace)
 
 		m := moduleMap[modAddr]
 		m.Resources = append(m.Resources, res)
@@ -416,32 +445,77 @@ func generateDescription(action, resourceType, name string) string {
 	}
 }
 
-func generateTerraformStyleDiff(before, after, afterUnknown map[string]interface{}, isReplace bool) string {
-	var sb strings.Builder
+func generateTerraformStyleDiff(rc ResourceChange, isReplace bool) []DiffLine {
+	var lines []DiffLine
+
+	actionPrefix := " "
+	switch rc.Change.Actions[0] {
+	case "create":
+		actionPrefix = "+"
+	case "delete":
+		actionPrefix = "-"
+	case "update":
+		actionPrefix = "~"
+	}
+
+	// Resource header line
+	lines = append(lines, DiffLine{Type: "header", Text: fmt.Sprintf("%s resource \"%s\" \"%s\" {", actionPrefix, rc.Type, rc.Name)})
+
+	// Generate diff for attributes
+	diffAttributes(rc.Change.Before, rc.Change.After, rc.Change.AfterUnknown, isReplace, 1, &lines)
+
+	lines = append(lines, DiffLine{Type: "header", Text: "}"})
+
+	return lines
+}
+
+func diffAttributes(before, after, afterUnknown map[string]interface{}, isReplace bool, indentLevel int, lines *[]DiffLine) {
+	indent := strings.Repeat("  ", indentLevel)
 	allKeys := uniqueSortedKeys(before, after, afterUnknown)
 
 	for _, key := range allKeys {
 		bv, bOk := before[key]
 		av, aOk := after[key]
-		auOk := afterUnknown != nil && afterUnknown[key] != nil
+		auv, auOk := afterUnknown[key]
+
+		comment := ifReplaceComment(isReplace)
 
 		if auOk {
-			if bOk {
-				sb.WriteString(fmt.Sprintf("~ %s = %s -> (known after apply)%s\n", key, formatValue(bv), ifReplaceComment(isReplace)))
-			} else {
-				sb.WriteString(fmt.Sprintf("+ %s = (known after apply)%s\n", key, ifReplaceComment(isReplace)))
+			if bVal, isBool := auv.(bool); isBool && bVal {
+				// Value is unknown after apply and is a true boolean
+				if bOk {
+					*lines = append(*lines, DiffLine{Type: "modified", Text: fmt.Sprintf("%s  %s = %s => (known after apply)%s", indent, key, formatValue(bv), comment)})
+				} else {
+					*lines = append(*lines, DiffLine{Type: "added", Text: fmt.Sprintf("%s+ %s = (known after apply)%s", indent, key, comment)})
+				}
+				continue // Processed this key, move to next
 			}
-		} else if bOk && !aOk {
-			sb.WriteString(fmt.Sprintf("- %s = %s%s\n", key, formatValue(bv), ifReplaceComment(isReplace)))
-		} else if !bOk && aOk {
-			sb.WriteString(fmt.Sprintf("+ %s = %s%s\n", key, formatValue(av), ifReplaceComment(isReplace)))
-		} else if bOk && aOk && !deepEqual(bv, av) {
-			sb.WriteString(fmt.Sprintf("~ %s = %s -> %s%s\n", key, formatValue(bv), formatValue(av), ifReplaceComment(isReplace)))
+			// If auv is not a bool, or is false, fall through to other change types
 		}
 
+		if bOk && !aOk {
+			// Removed attribute
+			*lines = append(*lines, DiffLine{Type: "removed", Text: fmt.Sprintf("%s- %s = %s%s", indent, key, formatValue(bv), comment)})
+		} else if !bOk && aOk {
+			// Added attribute
+			*lines = append(*lines, DiffLine{Type: "added", Text: fmt.Sprintf("%s+ %s = %s%s", indent, key, formatValue(av), comment)})
+		} else if bOk && aOk && !deepEqual(bv, av) {
+			// Modified attribute
+			// Handle nested structures recursively
+			if bMap, bIsMap := bv.(map[string]interface{}); bIsMap {
+				if aMap, aIsMap := av.(map[string]interface{}); aIsMap {
+					*lines = append(*lines, DiffLine{Type: "modified", Text: fmt.Sprintf("%s  %s {", indent, key)})
+					diffAttributes(bMap, aMap, afterUnknown, isReplace, indentLevel+1, lines)
+					*lines = append(*lines, DiffLine{Type: "modified", Text: fmt.Sprintf("%s}", indent)})
+					continue
+				}
+			}
+			*lines = append(*lines, DiffLine{Type: "modified", Text: fmt.Sprintf("%s~ %s = %s => %s%s", indent, key, formatValue(bv), formatValue(av), comment)})
+		} else {
+			// Unchanged attribute
+			*lines = append(*lines, DiffLine{Type: "unchanged", Text: fmt.Sprintf("%s  %s = %s", indent, key, formatValue(av))})
+		}
 	}
-
-	return sb.String()
 }
 
 func ifReplaceComment(isReplace bool) string {
@@ -468,17 +542,22 @@ func uniqueSortedKeys(maps ...map[string]interface{}) []string {
 
 func formatValue(v interface{}) string {
 	if v == nil {
-		return "<nil>"
+		return "null"
 	}
 
 	switch val := v.(type) {
 	case string:
 		return fmt.Sprintf("%q", val)
+	case float64:
+		return fmt.Sprintf("%g", val)
+	case bool:
+		return fmt.Sprintf("%t", val)
 	case map[string]interface{}, []interface{}:
 		out, err := json.MarshalIndent(val, "", "  ")
 		if err == nil {
 			return string(out)
 		}
+		return fmt.Sprintf("%v", v) // Fallback if JSON marshaling fails
 	}
 
 	return fmt.Sprintf("%v", v)
@@ -486,321 +565,297 @@ func formatValue(v interface{}) string {
 
 func generateHTML(analysis AnalyzedPlan) string {
 	htmlTemplate := `<!DOCTYPE html>
+
 <html lang="ko">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Terraform Plan Analysis</title>
   <style>
+    :root {
+      --background-color: #f7f8fa;
+      --container-bg: #ffffff;
+      --sidebar-bg: #f1f3f6;
+      --border-color: #e1e4e8;
+      --text-color: #24292e;
+      --text-secondary-color: #586069;
+      --accent-color: #0366d6;
+      --create-color: #28a745;
+      --update-color: #dbab09;
+      --delete-color: #d73a49;
+      --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
     * {
+      box-sizing: border-box;
       margin: 0;
       padding: 0;
-      box-sizing: border-box;
     }
     body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
+      font-family: var(--font-family);
+      background-color: var(--background-color);
+      color: var(--text-color);
+      font-size: 14px;
     }
     .container {
       max-width: 1200px;
-      margin: 0 auto;
-      background: rgba(255, 255, 255, 0.95);
-      border-radius: 20px;
-      backdrop-filter: blur(10px);
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+      margin: 20px auto;
+      background: var(--container-bg);
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
       overflow: hidden;
     }
     .header {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 30px;
-      text-align: center;
+      padding: 20px;
+      border-bottom: 1px solid var(--border-color);
     }
     .header h1 {
-      font-size: 2.5em;
-      margin-bottom: 10px;
-      font-weight: 300;
+      font-size: 24px;
+      margin-bottom: 5px;
     }
     .header .subtitle {
-      opacity: 0.9;
-      font-size: 1.1em;
+      font-size: 12px;
+      color: var(--text-secondary-color);
+    }
+    .search-container {
+      margin-top: 15px;
+    }
+    .search-container input {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      font-size: 14px;
     }
     .summary {
-      padding: 30px;
-      border-bottom: 1px solid #eee;
-    }
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-      gap: 20px;
-      margin-top: 20px;
-    }
-    .summary-card {
-      background: #f8f9fa;
       padding: 20px;
-      border-radius: 12px;
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      gap: 20px;
+    }
+    .summary-item {
       text-align: center;
-      border-left: 4px solid #667eea;
     }
-    .summary-card h3 {
-      color: #333;
-      font-size: 2em;
-      margin-bottom: 5px;
+    .summary-item h2 {
+      font-size: 28px;
     }
-    .summary-card p {
-      color: #666;
-      font-size: 0.9em;
+    .summary-item p {
+      font-size: 12px;
+      color: var(--text-secondary-color);
     }
-    .modules {
-      padding: 30px;
+    .filters {
+      display: flex;
+      gap: 10px;
+      margin-top: 15px;
+      justify-content: center;
+    }
+    .filter-btn {
+      background-color: #fff;
+      border: 1px solid var(--border-color);
+      padding: 8px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: background-color 0.2s, color 0.2s;
+    }
+    .filter-btn:hover {
+      background-color: #f0f0f0;
+    }
+    .filter-btn.active {
+      background-color: var(--accent-color);
+      color: white;
+      border-color: var(--accent-color);
     }
     .module {
-      margin-bottom: 30px;
-      border: 1px solid #e0e0e0;
-      border-radius: 12px;
-      overflow: hidden;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .module:last-child {
+      border-bottom: none;
     }
     .module-header {
-      background: #f8f9fa;
-      padding: 20px;
-      border-bottom: 1px solid #e0e0e0;
-    }
-    .module-title {
-      font-size: 1.3em;
-      color: #333;
-      margin-bottom: 10px;
-    }
-    .module-info {
-      display: flex;
-      gap: 20px;
-      flex-wrap: wrap;
-    }
-    .module-info span {
-      background: #667eea;
-      color: white;
-      padding: 5px 12px;
-      border-radius: 20px;
-      font-size: 0.8em;
-    }
-    .resources {
-      padding: 20px;
+      background: var(--sidebar-bg);
+      padding: 10px 20px;
+      font-size: 16px;
+      font-weight: 600;
     }
     .resource {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 15px;
-      margin-bottom: 10px;
-      background: #fff;
-      border-radius: 8px;
-      border-left: 4px solid #ddd;
-      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+      padding: 15px 20px;
+      border-bottom: 1px solid var(--border-color);
       cursor: pointer;
-      overflow: visible; 
     }
-    .resource.create {
-      border-left-color: #28a745;
+    .resource:last-child {
+      border-bottom: none;
     }
-    .resource.update {
-      border-left-color: #ffc107;
+    .resource-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
-    .resource.delete {
-      border-left-color: #dc3545;
-    }
-    .resource-info {
-      flex: 1;
-      min-width: 0;
-    }
-    .resource-info h4 {
-      color: #333;
-      margin-bottom: 5px;
-    }
-    .resource-info p {
-      color: #666;
-      font-size: 0.9em;
-    }
-    .resource-meta {
-      text-align: right;
-      min-width: 120px;
-      flex-shrink: 0;
-    }
-    .action-badge {
-      padding: 5px 12px;
-      border-radius: 20px;
-      font-size: 0.8em;
+    .action-icon {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      color: white;
+      text-align: center;
+      line-height: 20px;
       font-weight: bold;
       text-transform: uppercase;
-      user-select: none;
     }
-    .action-create {
-      background: #d4edda;
-      color: #155724;
+    .action-icon.create { background-color: var(--create-color); }
+    .action-icon.update { background-color: var(--update-color); }
+    .action-icon.delete { background-color: var(--delete-color); }
+    .resource.resource-changed-create { border-left: 4px solid var(--create-color); }
+    .resource.resource-changed-update { border-left: 4px solid var(--update-color); }
+    .resource.resource-changed-delete { border-left: 4px solid var(--delete-color); }
+    .resource-info h3 {
+      font-size: 16px;
     }
-    .action-update {
-      background: #fff3cd;
-      color: #856404;
-    }
-    .action-delete {
-      background: #f8d7da;
-      color: #721c24;
-    }
-    .action-no-op {
-      background: #e2e3e5;
-      color: #383d41;
-    }
-    .impact {
-      margin-top: 5px;
-      font-size: 0.8em;
-      color: #666;
+    .resource-info p {
+      font-size: 12px;
+      color: var(--text-secondary-color);
     }
     .details {
-      background-color: #f0f0f0;
-      border: 1px solid #ddd;
-      border-radius: 6px;
-      max-height: 300px;
-      width: 100%;
-      margin-top: 8px;
-      padding: 0;
+      margin-top: 15px;
+      padding-left: 30px;
       display: none;
-      overflow: auto;
-      position: relative;
     }
-
     .details pre {
-      font-family: 'Courier New', Consolas, monospace;
-      font-size: 0.85em;
-      white-space: pre;
-      padding: 10px;
-      margin: 0;
-      min-width: max-content; 
-      color: #333;
-      line-height: 1.4;
+      background: #f6f8fa;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 15px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+      font-size: 12px;
     }
-    
-    @media (max-width: 768px) {
-      .container {
-        margin: 10px;
-        border-radius: 12px;
-      }
-      .header {
-        padding: 20px;
-      }
-      .header h1 {
-        font-size: 2em;
-      }
-      .summary,
-      .modules {
-        padding: 20px;
-      }
-      .resource {
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 10px;
-      }
-      .resource-meta {
-        text-align: left;
-        min-width: auto;
-      }
-      .details {
-        max-height: 200px; 
-      }
+    .diff-line-added {
+      background-color: #e6ffed;
+    }
+    .diff-line-removed {
+      background-color: #ffeef0;
+    }
+    .diff-line-modified {
+      background-color: #fffab8;
+    }
+    .diff-line-unchanged {
+      color: var(--text-secondary-color);
     }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>Terraform Plan Result Summary</h1>
+      <h1>Terraform Plan</h1>
       <div class="subtitle">{{.Timestamp}} (v{{.TerraformVersion}})</div>
-    </div>
-
-    <div class="summary">
-      <h2>Summary</h2>
-      <div class="summary-grid">
-        <div class="summary-card">
-          <h3>{{.Summary.TotalResources}}</h3>
-          <p>Total Resources</p>
-        </div>
-        <div class="summary-card">
-          <h3>{{index .Summary.Actions "create"}}</h3>
-          <p>Create</p>
-        </div>
-        <div class="summary-card">
-          <h3>{{index .Summary.Actions "update"}}</h3>
-          <p>Update</p>
-        </div>
-        <div class="summary-card">
-          <h3>{{index .Summary.Actions "delete"}}</h3>
-          <p>Delete</p>
-        </div>
+      <div class="search-container">
+        <input type="text" id="resourceSearch" placeholder="Search resources..." onkeyup="filterResources()">
       </div>
     </div>
-
-    <div class="modules">
-      <h2>Resources by Module</h2>
+    <div class="summary">
+      <div class="summary-item">
+        <h2>{{.Summary.TotalResources}}</h2>
+        <p>Total</p>
+      </div>
+      <div class="summary-item">
+        <h2 style="color: var(--create-color)">{{index .Summary.Actions "create"}}</h2>
+        <p>Create</p>
+      </div>
+      <div class="summary-item">
+        <h2 style="color: var(--update-color)">{{index .Summary.Actions "update"}}</h2>
+        <p>Update</p>
+      </div>
+      <div class="summary-item">
+        <h2 style="color: var(--delete-color)">{{index .Summary.Actions "delete"}}</h2>
+        <p>Delete</p>
+      </div>
+      <div class="filters">
+        <button class="filter-btn active" data-action="all" onclick="filterByAction('all', this)">All</button>
+        <button class="filter-btn" data-action="create" onclick="filterByAction('create', this)">Create</button>
+        <button class="filter-btn" data-action="update" onclick="filterByAction('update', this)">Update</button>
+        <button class="filter-btn" data-action="delete" onclick="filterByAction('delete', this)">Delete</button>
+        <button class="filter-btn" data-action="no-op" onclick="filterByAction('no-op', this)">No-op</button>
+      </div>
+    </div>
+    <div class="resource-list">
       {{range .Modules}}
       <div class="module">
         <div class="module-header">
-          <div class="module-title">{{.Address}}</div>
-          <div class="module-info">
-            <span>Resources: {{.Summary.ResourceCount}}</span>
-            <span>Created: {{index .Summary.Actions "create"}}</span>
-            <span>Updated: {{index .Summary.Actions "update"}}</span>
-            <span>Deleted: {{index .Summary.Actions "delete"}}</span>
-          </div>
+          <h2>{{.Address}}</h2>
         </div>
-        <div class="resources">
-          {{range .Resources}}
-          <div class="resource {{.Action}}" onclick="toggleDetails(this)">
+        {{range .Resources}}
+        <div class="resource{{if ne .Action "no-op"}} resource-changed-{{.Action}}{{end}}" onclick="toggleDetails(this)">
+          <div class="resource-header">
+            <div class="action-icon {{.Action}}">{{slice .Action 0 1}}</div>
             <div class="resource-info">
-              <h4>{{.Address}}</h4>
-              <p>{{.Description}}</p>
-              <div class="details">
-                <pre>{{.DiffText}}</pre>
-              </div>
-            </div>
-            <div class="resource-meta">
-              <div class="action-badge action-{{.Action}}">{{.Action}}</div>
-              <div class="impact">{{.Impact}}</div>
+              <h3>{{.Address}}</h3>
+              <p>{{.Type}}</p>
             </div>
           </div>
-          {{end}}
+          <div class="details">
+            <pre>{{range .DiffLines}}<div class="diff-line-{{.Type}}">{{.Text}}</div>{{end}}</pre>
+            {{if .PolicyDocumentJSON}}
+            <h4>Policy Document:</h4>
+            <pre>{{.PolicyDocumentJSON}}</pre>
+            {{end}}
+          </div>
         </div>
+        {{end}}
       </div>
       {{end}}
     </div>
   </div>
 
   <script>
-    function formatJSON(text) {
-      return text.replace(/(\{[^{}]*\}|\[[^\[\]]*\])/g, function(match) {
-        try {
-          const parsed = JSON.parse(match);
-          return JSON.stringify(parsed, null, 2);
-        } catch (e) {
-          return match;
+    function toggleDetails(el) {
+      const details = el.querySelector('.details');
+      if (details.style.display === 'block') {
+        details.style.display = 'none';
+      } else {
+        details.style.display = 'block';
+      }
+    }
+
+    function filterResources() {
+      const input = document.getElementById('resourceSearch');
+      const filterText = input.value.toLowerCase();
+      const activeFilterButton = document.querySelector('.filter-btn.active');
+      const filterAction = activeFilterButton ? activeFilterButton.dataset.action : 'all';
+
+      const modules = document.querySelectorAll('.module');
+
+      modules.forEach(module => {
+        let moduleHasVisibleResources = false;
+        const resources = module.querySelectorAll('.resource');
+        resources.forEach(resource => {
+          const address = resource.querySelector('h3').textContent.toLowerCase();
+          const type = resource.querySelector('p').textContent.toLowerCase();
+          const action = resource.querySelector('.action-icon').classList[1]; // e.g., "create", "update"
+
+          const matchesSearch = address.includes(filterText) || type.includes(filterText) || action.includes(filterText);
+          const matchesAction = filterAction === 'all' || action === filterAction;
+
+          if (matchesSearch && matchesAction) {
+            resource.style.display = '';
+            moduleHasVisibleResources = true;
+          } else {
+            resource.style.display = 'none';
+          }
+        });
+
+        // Show/hide module header based on whether it has visible resources
+        if (moduleHasVisibleResources) {
+          module.style.display = '';
+        } else {
+          module.style.display = 'none';
         }
       });
     }
 
-    function toggleDetails(el) {
-      const detail = el.querySelector(".details");
-      const pre = detail.querySelector("pre");
-      
-      if (detail.style.display === "block") {
-        detail.style.display = "none";
-      } else {
-        detail.style.display = "block";
-        
-        if (!pre.dataset.formatted) {
-          const originalText = pre.textContent;
-          const formattedText = formatJSON(originalText);
-          pre.textContent = formattedText;
-          pre.dataset.formatted = "true";
-        }
-      }
+    function filterByAction(action, clickedButton) {
+      const filterButtons = document.querySelectorAll('.filter-btn');
+      filterButtons.forEach(btn => btn.classList.remove('active'));
+      clickedButton.classList.add('active');
+      filterResources(); // Re-run filter with new action
     }
   </script>
 </body>
