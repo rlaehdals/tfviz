@@ -88,16 +88,19 @@ type DiffLine struct {
 }
 
 type ResourceAnalysis struct {
-	Address     string         `json:"address"`
-	Type        string         `json:"type"`
-	Name        string         `json:"name"`
-	Provider    string         `json:"provider"`
-	Action      string         `json:"action"`
-	Changes     []ChangeDetail `json:"changes,omitempty"`
-	Impact      string         `json:"impact"`
-	Description string         `json:"description"`
-	DiffLines   []DiffLine     `json:"diff_lines"`
-	PolicyDocumentJSON string         `json:"policy_document_json,omitempty"`
+	Address            string                 `json:"address"`
+	Type               string                 `json:"type"`
+	Name               string                 `json:"name"`
+	Provider           string                 `json:"provider"`
+	Action             string                 `json:"action"`
+	Changes            []ChangeDetail         `json:"changes,omitempty"`
+	Impact             string                 `json:"impact"`
+	Description        string                 `json:"description"`
+	DiffLines          []DiffLine             `json:"diff_lines"`
+	PolicyDocumentJSON string                 `json:"policy_document_json,omitempty"`
+	After              map[string]interface{} `json:"after,omitempty"`
+
+	DependsOn []string `json:"depends_on,omitempty"`
 }
 
 type ChangeDetail struct {
@@ -137,6 +140,17 @@ Usage:
 func handlePlan(args []string) {
 	planBinaryFile := "tfplan"
 
+	showGraph := false
+	filtered := []string{}
+	for _, a := range args {
+		if a == "--graph" || a == "-g" {
+			showGraph = true
+			continue
+		}
+		filtered = append(filtered, a)
+	}
+	args = filtered
+
 	fmt.Println("🔄 Running terraform plan...")
 	planArgs := append([]string{"plan", "-out=" + planBinaryFile}, args...)
 	cmd := exec.Command("terraform", planArgs...)
@@ -163,7 +177,7 @@ func handlePlan(args []string) {
 	}
 
 	analyzed := analyzePlan(plan)
-	html := generateHTML(analyzed)
+	html := generateHTML(analyzed, showGraph)
 
 	err = os.Remove(planBinaryFile)
 	if err != nil {
@@ -175,7 +189,7 @@ func handlePlan(args []string) {
 	serveHTMLOnce(html)
 }
 
-func generateHTMLFromJSON(planFile string) {
+func generateHTMLFromJSON(planFile string, showGraph bool) {
 	fmt.Println("📊 Analyzing terraform plan...")
 
 	data, err := os.ReadFile(planFile)
@@ -192,8 +206,8 @@ func generateHTMLFromJSON(planFile string) {
 	}
 
 	analyzed := analyzePlan(plan)
-	filename := generateHTML(analyzed)
-	serveHTMLOnce(filename)
+	html := generateHTML(analyzed, showGraph)
+	serveHTMLOnce(html)
 }
 
 func serveHTMLOnce(html string) {
@@ -252,7 +266,11 @@ func analyzePlan(plan TerraformPlan) AnalyzedPlan {
 	for _, rc := range plan.ResourceChanges {
 		action := "no-op"
 		if len(rc.Change.Actions) > 0 {
-			action = rc.Change.Actions[0]
+    		if len(rc.Change.Actions) == 2 && rc.Change.Actions[0] == "delete" && rc.Change.Actions[1] == "create" {
+        		action = "update" // replace는 update로 처리
+    		} else {
+        		action = rc.Change.Actions[0]
+    		}
 		}
 		analyzed.Summary.Actions[action]++
 		providerSet[rc.ProviderName] = true
@@ -279,6 +297,20 @@ func analyzePlan(plan TerraformPlan) AnalyzedPlan {
 			Action:      action,
 			Impact:      determineImpact(action, rc.Type),
 			Description: generateDescription(action, rc.Type, rc.Name),
+			After:       rc.Change.After,
+		}
+
+		if depVal, ok := rc.Change.After["depends_on"]; ok {
+			switch deps := depVal.(type) {
+			case []interface{}:
+				for _, d := range deps {
+					if s, ok := d.(string); ok {
+						res.DependsOn = append(res.DependsOn, s)
+					}
+				}
+			case []string:
+				res.DependsOn = append(res.DependsOn, deps...)
+			}
 		}
 
 		// Check for policy documents and pretty-print them
@@ -518,6 +550,71 @@ func diffAttributes(before, after, afterUnknown map[string]interface{}, isReplac
 	}
 }
 
+func buildGraphJSON(analyzed AnalyzedPlan) (string, string, error) {
+	type elem struct {
+		Data    map[string]interface{} `json:"data"`
+		Classes string                 `json:"classes,omitempty"`
+	}
+
+	elements := make([]elem, 0)
+	resourceDetails := map[string]ResourceAnalysis{}
+
+	// add module nodes and resource nodes + edges
+	for _, m := range analyzed.Modules {
+		modID := "mod:" + m.Address
+		elements = append(elements, elem{
+			Data:    map[string]interface{}{"id": modID, "label": m.Address, "group": "module"},
+			Classes: "module",
+		})
+
+		for _, r := range m.Resources {
+			// resource node
+			rID := r.Address
+			label := r.Address
+			if r.Name != "" {
+				label = r.Name + " (" + r.Type + ")"
+			}
+			classes := "resource"
+			if r.Action != "" {
+				classes = classes + " " + r.Action
+			}
+
+			elements = append(elements, elem{
+				Data:    map[string]interface{}{"id": rID, "label": label, "type": r.Type, "action": r.Action},
+				Classes: classes,
+			})
+
+			// edge: module -> resource (containment)
+			eID := "edge:contains:" + modID + ":" + rID
+			elements = append(elements, elem{
+				Data: map[string]interface{}{"id": eID, "source": modID, "target": rID, "label": "contains"},
+			})
+
+			// add depends_on edges (resource -> resource)
+			for _, dep := range r.DependsOn {
+				// dep might be like "aws_instance.foo"; only add edge if dep exists as node later (cytoscape tolerates missing nodes)
+				edgeID := "edge:dep:" + dep + "->" + rID
+				elements = append(elements, elem{
+					Data: map[string]interface{}{"id": edgeID, "source": dep, "target": rID, "label": "depends_on"},
+				})
+			}
+
+			resourceDetails[r.Address] = r
+		}
+	}
+
+	// produce JSON strings
+	elJSON, err := json.Marshal(elements)
+	if err != nil {
+		return "", "", err
+	}
+	rdJSON, err := json.Marshal(resourceDetails)
+	if err != nil {
+		return "", "", err
+	}
+	return string(elJSON), string(rdJSON), nil
+}
+
 func ifReplaceComment(isReplace bool) string {
 	if isReplace {
 		return " # forces replacement"
@@ -563,7 +660,32 @@ func formatValue(v interface{}) string {
 	return fmt.Sprintf("%v", v)
 }
 
-func generateHTML(analysis AnalyzedPlan) string {
+func formatJSON(s string) (string, bool) {
+	var js interface{}
+	if err := json.Unmarshal([]byte(s), &js); err != nil {
+		return s, false
+	}
+	out, err := json.MarshalIndent(js, "", "  ")
+	if err != nil {
+		return s, false
+	}
+	return string(out), true
+}
+
+func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
+	graphJSON, resourceDetailsJSON, _ := buildGraphJSON(analysis)
+	data := struct {
+		AnalyzedPlan
+		GraphJSON           template.JS
+		ResourceDetailsJSON template.JS
+		ShowGraph           bool
+	}{
+		AnalyzedPlan:        analysis,
+		GraphJSON:           template.JS(graphJSON),
+		ResourceDetailsJSON: template.JS(resourceDetailsJSON),
+		ShowGraph:           showGraph,
+	}
+
 	htmlTemplate := `<!DOCTYPE html>
 
 <html lang="ko">
@@ -571,6 +693,9 @@ func generateHTML(analysis AnalyzedPlan) string {
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Terraform Plan Analysis</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
   <style>
     :root {
       --background-color: #f7f8fa;
@@ -664,6 +789,12 @@ func generateHTML(analysis AnalyzedPlan) string {
       background-color: var(--accent-color);
       color: white;
       border-color: var(--accent-color);
+    }
+    #graph {
+      width: 100%;
+      height: 500px;
+      border: 1px solid var(--border-color);
+      margin-top: 20px;
     }
     .module {
       border-bottom: 1px solid var(--border-color);
@@ -776,6 +907,11 @@ func generateHTML(analysis AnalyzedPlan) string {
         <button class="filter-btn" data-action="no-op" onclick="filterByAction('no-op', this)">No-op</button>
       </div>
     </div>
+
+    {{if .ShowGraph}}
+    <div id="graph"></div>
+    {{end}}
+
     <div class="resource-list">
       {{range .Modules}}
       <div class="module">
@@ -804,6 +940,50 @@ func generateHTML(analysis AnalyzedPlan) string {
       {{end}}
     </div>
   </div>
+
+  {{if .ShowGraph}}
+  <script>
+    const elements = {{.GraphJSON}};
+    const cy = cytoscape({
+      container: document.getElementById('graph'),
+      elements: elements,
+      layout: { 
+        name: 'dagre',
+        rankDir: 'TB',
+        spacingFactor: 1.2,
+        nodeSep: 40, 
+        edgeSep: 20,
+        rankSep: 50,
+       },
+      style: [
+        { selector: 'node', style: {
+            'label': 'data(label)',
+			'width': 'label',    
+            'height': 'label',    
+            'padding': '12px',    
+            'text-valign': 'center',
+            'color': '#fff',
+            'text-outline-width': 2,
+            'text-outline-color': '#555',
+            'background-color': '#555',
+            'text-wrap': 'wrap',
+            'text-max-width': '80px'
+        }},
+        { selector: 'node.create', style: { 'background-color': '#28a745' }},
+        { selector: 'node.update', style: { 'background-color': '#dbab09' }},
+        { selector: 'node.delete', style: { 'background-color': '#d73a49' }},
+        { selector: 'node.module', style: { 'background-color': '#0366d6', 'shape': 'round-rectangle' }},
+        { selector: 'edge', style: {
+            'width': 2,
+            'line-color': '#ccc',
+            'target-arrow-color': '#ccc',
+            'target-arrow-shape': 'triangle',
+            'curve-style': 'bezier'
+        }}
+      ]
+    });
+  </script>
+  {{end}}
 
   <script>
     function toggleDetails(el) {
@@ -868,7 +1048,7 @@ func generateHTML(analysis AnalyzedPlan) string {
 	}
 
 	var buf bytes.Buffer
-	err = tmpl.Execute(&buf, analysis)
+	err = tmpl.Execute(&buf, data)
 	if err != nil {
 		fmt.Printf("❌ Error executing template: %v\n", err)
 		return "<html><body>Error rendering template</body></html>"
