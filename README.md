@@ -41,6 +41,7 @@ func serveHTMLOnce(html string) {
 ```
 
 ### 5. Visualize your Terraform plan
+
 In your Terraform project directory:
 
 ```bash
@@ -48,6 +49,12 @@ tfviz plan
 ```
 
 This will start a temporary local web server and automatically open your default browser to show the visualized plan.  
+
+To see a dependency graph of your resources, use the `--graph` or `-g` flag:
+
+```bash
+tfviz plan --graph
+```
 
 No HTML file is written to disk — everything runs in memory.
   
