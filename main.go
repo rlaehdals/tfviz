@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -15,10 +16,37 @@ import (
 )
 
 type TerraformPlan struct {
-	FormatVersion    string           `json:"format_version"`
-	TerraformVersion string           `json:"terraform_version"`
-	PlannedValues    PlannedValues    `json:"planned_values"`
-	ResourceChanges  []ResourceChange `json:"resource_changes"`
+	FormatVersion    string            `json:"format_version"`
+	TerraformVersion string            `json:"terraform_version"`
+	PlannedValues    PlannedValues     `json:"planned_values"`
+	ResourceChanges  []ResourceChange  `json:"resource_changes"`
+	Configuration    PlanConfiguration `json:"configuration"`
+}
+
+type PlanConfiguration struct {
+	RootModule ConfigModule `json:"root_module"`
+}
+
+type ConfigModule struct {
+	Resources   []ConfigResource            `json:"resources,omitempty"`
+	ModuleCalls map[string]ConfigModuleCall  `json:"module_calls,omitempty"`
+	Outputs     map[string]ConfigOutput      `json:"outputs,omitempty"`
+}
+
+type ConfigOutput struct {
+	Expression map[string]interface{} `json:"expression,omitempty"`
+}
+
+type ConfigModuleCall struct {
+	Expressions map[string]interface{} `json:"expressions,omitempty"`
+	Module      ConfigModule           `json:"module"`
+}
+
+type ConfigResource struct {
+	Address     string                 `json:"address"`
+	Type        string                 `json:"type"`
+	Name        string                 `json:"name"`
+	Expressions map[string]interface{} `json:"expressions"`
 }
 
 type PlannedValues struct {
@@ -121,6 +149,12 @@ func main() {
 
 	if command == "plan" {
 		handlePlan(args)
+	} else if command == "demo" {
+		if len(args) < 1 {
+			fmt.Println("Usage: tfviz demo <json-file>")
+			os.Exit(1)
+		}
+		generateHTMLFromJSON(args[0], true)
 	} else {
 		fmt.Println("❗️ Unsupported command:", command)
 		fmt.Println("Please use 'tfviz plan' to generate a plan visualization.")
@@ -177,7 +211,12 @@ func handlePlan(args []string) {
 	}
 
 	analyzed := analyzePlan(plan)
-	html := generateHTML(analyzed, showGraph)
+	refEdges := buildRefEdges(plan.Configuration)
+	containment := buildContainmentMap(plan.Configuration)
+	allPlanned := collectAllPlannedResources(plan.PlannedValues.RootModule)
+	enrichContainmentFromValues(allPlanned, containment)
+	plannedValues := buildPlannedValuesMap(allPlanned)
+	html := generateHTML(analyzed, showGraph, refEdges, containment, plannedValues)
 
 	err = os.Remove(planBinaryFile)
 	if err != nil {
@@ -206,7 +245,12 @@ func generateHTMLFromJSON(planFile string, showGraph bool) {
 	}
 
 	analyzed := analyzePlan(plan)
-	html := generateHTML(analyzed, showGraph)
+	refEdges := buildRefEdges(plan.Configuration)
+	containment := buildContainmentMap(plan.Configuration)
+	allPlanned := collectAllPlannedResources(plan.PlannedValues.RootModule)
+	enrichContainmentFromValues(allPlanned, containment)
+	plannedValues := buildPlannedValuesMap(allPlanned)
+	html := generateHTML(analyzed, showGraph, refEdges, containment, plannedValues)
 	serveHTMLOnce(html)
 }
 
@@ -267,7 +311,7 @@ func analyzePlan(plan TerraformPlan) AnalyzedPlan {
 		action := "no-op"
 		if len(rc.Change.Actions) > 0 {
     		if len(rc.Change.Actions) == 2 && rc.Change.Actions[0] == "delete" && rc.Change.Actions[1] == "create" {
-        		action = "update" // replace는 update로 처리
+        		action = "update"
     		} else {
         		action = rc.Change.Actions[0]
     		}
@@ -313,7 +357,6 @@ func analyzePlan(plan TerraformPlan) AnalyzedPlan {
 			}
 		}
 
-		// Check for policy documents and pretty-print them
 		if policyVal, ok := rc.Change.After["policy"]; ok {
 			if policyStr, isString := policyVal.(string); isString {
 				var parsedPolicy interface{}
@@ -490,10 +533,8 @@ func generateTerraformStyleDiff(rc ResourceChange, isReplace bool) []DiffLine {
 		actionPrefix = "~"
 	}
 
-	// Resource header line
 	lines = append(lines, DiffLine{Type: "header", Text: fmt.Sprintf("%s resource \"%s\" \"%s\" {", actionPrefix, rc.Type, rc.Name)})
 
-	// Generate diff for attributes
 	diffAttributes(rc.Change.Before, rc.Change.After, rc.Change.AfterUnknown, isReplace, 1, &lines)
 
 	lines = append(lines, DiffLine{Type: "header", Text: "}"})
@@ -514,26 +555,20 @@ func diffAttributes(before, after, afterUnknown map[string]interface{}, isReplac
 
 		if auOk {
 			if bVal, isBool := auv.(bool); isBool && bVal {
-				// Value is unknown after apply and is a true boolean
 				if bOk {
 					*lines = append(*lines, DiffLine{Type: "modified", Text: fmt.Sprintf("%s  %s = %s => (known after apply)%s", indent, key, formatValue(bv), comment)})
 				} else {
 					*lines = append(*lines, DiffLine{Type: "added", Text: fmt.Sprintf("%s+ %s = (known after apply)%s", indent, key, comment)})
 				}
-				continue // Processed this key, move to next
+				continue
 			}
-			// If auv is not a bool, or is false, fall through to other change types
 		}
 
 		if bOk && !aOk {
-			// Removed attribute
 			*lines = append(*lines, DiffLine{Type: "removed", Text: fmt.Sprintf("%s- %s = %s%s", indent, key, formatValue(bv), comment)})
 		} else if !bOk && aOk {
-			// Added attribute
 			*lines = append(*lines, DiffLine{Type: "added", Text: fmt.Sprintf("%s+ %s = %s%s", indent, key, formatValue(av), comment)})
 		} else if bOk && aOk && !deepEqual(bv, av) {
-			// Modified attribute
-			// Handle nested structures recursively
 			if bMap, bIsMap := bv.(map[string]interface{}); bIsMap {
 				if aMap, aIsMap := av.(map[string]interface{}); aIsMap {
 					*lines = append(*lines, DiffLine{Type: "modified", Text: fmt.Sprintf("%s  %s {", indent, key)})
@@ -544,13 +579,503 @@ func diffAttributes(before, after, afterUnknown map[string]interface{}, isReplac
 			}
 			*lines = append(*lines, DiffLine{Type: "modified", Text: fmt.Sprintf("%s~ %s = %s => %s%s", indent, key, formatValue(bv), formatValue(av), comment)})
 		} else {
-			// Unchanged attribute
 			*lines = append(*lines, DiffLine{Type: "unchanged", Text: fmt.Sprintf("%s  %s = %s", indent, key, formatValue(av))})
 		}
 	}
 }
 
-func buildGraphJSON(analyzed AnalyzedPlan) (string, string, error) {
+func extractReferences(v interface{}) []string {
+	var refs []string
+	switch val := v.(type) {
+	case map[string]interface{}:
+		if refList, ok := val["references"]; ok {
+			if arr, ok := refList.([]interface{}); ok {
+				for _, item := range arr {
+					if s, ok := item.(string); ok {
+						refs = append(refs, s)
+					}
+				}
+			}
+		}
+		for _, child := range val {
+			refs = append(refs, extractReferences(child)...)
+		}
+	case []interface{}:
+		for _, child := range val {
+			refs = append(refs, extractReferences(child)...)
+		}
+	}
+	return refs
+}
+
+func normalizeRef(ref string) string {
+	parts := strings.Split(ref, ".")
+	for i, p := range parts {
+		if strings.Contains(p, "_") && i+1 < len(parts) {
+			return strings.Join(parts[:i+2], ".")
+		}
+	}
+	if len(parts) >= 2 {
+		return parts[0] + "." + parts[1]
+	}
+	return ref
+}
+
+var indexSuffixRe = regexp.MustCompile(`\[[^\]]+\]`)
+
+func stripIndex(addr string) string {
+	return indexSuffixRe.ReplaceAllString(addr, "")
+}
+
+func resolveRef(ref string, modulePrefix string, varMap map[string]string) string {
+	parts := strings.Split(ref, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	first := parts[0]
+
+	if first == "var" && varMap != nil {
+		varName := parts[1]
+		if resolved, ok := varMap[varName]; ok {
+			return resolved
+		}
+		return ""
+	}
+	if first == "local" || first == "each" || first == "data" {
+		return ""
+	}
+
+	normalized := normalizeRef(ref)
+	if strings.HasPrefix(normalized, "module.") {
+		return normalized
+	}
+	if modulePrefix != "" {
+		return modulePrefix + "." + normalized
+	}
+	return normalized
+}
+
+func isModuleOnlyPrefix(addr string) bool {
+	parts := strings.Split(addr, ".")
+	if len(parts) < 2 || parts[0] != "module" {
+		return false
+	}
+	for _, p := range parts {
+		if strings.Contains(p, "_") {
+			return false
+		}
+	}
+	return true
+}
+
+func buildModuleOutputMap(config PlanConfiguration) map[string]string {
+	result := map[string]string{}
+	collectOutputs(config.RootModule, "", result)
+	return result
+}
+
+func collectOutputs(mod ConfigModule, modulePrefix string, result map[string]string) {
+	for callName, call := range mod.ModuleCalls {
+		childPrefix := "module." + callName
+		if modulePrefix != "" {
+			childPrefix = modulePrefix + ".module." + callName
+		}
+
+		for outputName, output := range call.Module.Outputs {
+			refs := getDirectRefs(output.Expression)
+			for _, ref := range refs {
+				parts := strings.Split(ref, ".")
+				if len(parts) < 2 {
+					continue
+				}
+				if parts[0] == "var" || parts[0] == "local" || parts[0] == "each" {
+					continue
+				}
+				normalized := normalizeRef(ref)
+				if !strings.HasPrefix(normalized, "module.") {
+					normalized = childPrefix + "." + normalized
+				}
+				result[childPrefix+"."+outputName] = normalized
+				break
+			}
+		}
+
+		collectOutputs(call.Module, childPrefix, result)
+	}
+}
+
+func buildVarMap(callExprs map[string]interface{}, outputMap map[string]string) map[string]string {
+	result := map[string]string{}
+	for varName, expr := range callExprs {
+		refs := getDirectRefs(expr)
+		for _, ref := range refs {
+			parts := strings.Split(ref, ".")
+			if len(parts) < 2 {
+				continue
+			}
+			first := parts[0]
+			if first == "var" || first == "local" || first == "each" || first == "data" {
+				continue
+			}
+
+			if outputMap != nil {
+				if addr, ok := outputMap[ref]; ok {
+					result[varName] = addr
+					break
+				}
+			}
+
+			normalized := normalizeRef(ref)
+			if !isModuleOnlyPrefix(normalized) {
+				result[varName] = normalized
+				break
+			}
+		}
+	}
+	return result
+}
+
+func propagateParentVars(callExprs map[string]interface{}, parentVarMap map[string]string, childVarMap map[string]string) {
+	if parentVarMap == nil {
+		return
+	}
+	for varName, expr := range callExprs {
+		if _, exists := childVarMap[varName]; exists {
+			continue
+		}
+		refs := getDirectRefs(expr)
+		for _, ref := range refs {
+			parts := strings.Split(ref, ".")
+			if len(parts) >= 2 && parts[0] == "var" {
+				if resolved, ok := parentVarMap[parts[1]]; ok {
+					childVarMap[varName] = resolved
+					break
+				}
+			}
+		}
+	}
+}
+
+func buildRefEdges(config PlanConfiguration) map[string][]string {
+	edges := map[string][]string{}
+	outputMap := buildModuleOutputMap(config)
+	collectFromModule(config.RootModule, "", nil, edges, outputMap)
+	return edges
+}
+
+func collectFromModule(mod ConfigModule, modulePrefix string, varMap map[string]string, edges map[string][]string, outputMap map[string]string) {
+	for _, res := range mod.Resources {
+		srcAddr := res.Address
+		if modulePrefix != "" {
+			srcAddr = modulePrefix + "." + res.Address
+		}
+
+		rawRefs := extractReferences(res.Expressions)
+
+		seen := map[string]bool{}
+		for _, ref := range rawRefs {
+			resolved := resolveRef(ref, modulePrefix, varMap)
+			if resolved == "" || resolved == srcAddr || seen[resolved] {
+				continue
+			}
+			seen[resolved] = true
+			edges[srcAddr] = append(edges[srcAddr], resolved)
+		}
+	}
+
+	for callName, call := range mod.ModuleCalls {
+		childPrefix := "module." + callName
+		if modulePrefix != "" {
+			childPrefix = modulePrefix + ".module." + callName
+		}
+		childVarMap := buildVarMap(call.Expressions, outputMap)
+		propagateParentVars(call.Expressions, varMap, childVarMap)
+		collectFromModule(call.Module, childPrefix, childVarMap, edges, outputMap)
+	}
+}
+
+type containmentKeyDef struct {
+	childTypes []string
+	priority   int
+}
+
+var containmentKeys = map[string]containmentKeyDef{
+	"subnet_id":  {priority: 50},
+	"subnet_ids": {priority: 50},
+	"subnets":    {priority: 50},
+	"vpc_id":     {priority: 100},
+
+	"route_table_id":    {childTypes: []string{"aws_route", "aws_route_table_association"}, priority: 30},
+	"security_group_id": {childTypes: []string{"aws_security_group_rule", "aws_vpc_security_group_"}, priority: 30},
+	"network_acl_id":    {childTypes: []string{"aws_network_acl_rule"}, priority: 30},
+
+	"load_balancer_arn": {childTypes: []string{"aws_lb_listener", "aws_alb_listener", "aws_lb_target_group"}, priority: 30},
+	"listener_arn":      {childTypes: []string{"aws_lb_listener_rule", "aws_alb_listener_rule", "aws_lb_listener_certificate"}, priority: 20},
+	"target_group_arn":  {childTypes: []string{"aws_lb_target_group_attachment", "aws_alb_target_group_attachment"}, priority: 30},
+
+	"cluster": {childTypes: []string{"aws_ecs_service", "aws_ecs_task"}, priority: 30},
+
+	"application": {childTypes: []string{"aws_elastic_beanstalk_environment", "aws_elastic_beanstalk_application_version"}, priority: 30},
+
+	"bucket": {childTypes: []string{"aws_s3_bucket_", "aws_s3_object"}, priority: 30},
+
+	"role": {childTypes: []string{"aws_iam_role_policy", "aws_iam_instance_profile"}, priority: 30},
+
+	"rest_api_id": {childTypes: []string{"aws_api_gateway_"}, priority: 30},
+
+	"function_name": {childTypes: []string{"aws_lambda_permission", "aws_lambda_alias", "aws_lambda_event_source_mapping", "aws_lambda_function_url", "aws_lambda_provisioned_concurrency"}, priority: 30},
+
+	"log_group_name": {childTypes: []string{"aws_cloudwatch_log_stream", "aws_cloudwatch_log_metric_filter", "aws_cloudwatch_log_subscription_filter"}, priority: 30},
+
+	"repository": {childTypes: []string{"aws_ecr_lifecycle_policy", "aws_ecr_repository_policy"}, priority: 30},
+
+	"cluster_identifier":    {childTypes: []string{"aws_rds_cluster_instance", "aws_rds_cluster_endpoint"}, priority: 30},
+	"db_subnet_group_name":  {childTypes: []string{"aws_db_instance", "aws_rds_cluster"}, priority: 40},
+	"db_instance_identifier": {childTypes: []string{"aws_db_instance_role_association", "aws_db_snapshot"}, priority: 30},
+
+	"replication_group_id": {childTypes: []string{"aws_elasticache_cluster"}, priority: 30},
+
+	"autoscaling_group_name": {childTypes: []string{"aws_autoscaling_attachment", "aws_autoscaling_policy", "aws_autoscaling_schedule", "aws_autoscaling_lifecycle_hook"}, priority: 30},
+	"launch_template":        {childTypes: []string{"aws_autoscaling_group"}, priority: 40},
+
+	"user_pool_id": {childTypes: []string{"aws_cognito_user_pool_client", "aws_cognito_user_group", "aws_cognito_resource_server", "aws_cognito_identity_provider", "aws_cognito_user_pool_domain"}, priority: 30},
+
+	"topic_arn": {childTypes: []string{"aws_sns_topic_subscription", "aws_sns_topic_policy"}, priority: 30},
+	"queue_url": {childTypes: []string{"aws_sqs_queue_policy", "aws_sqs_queue_redrive_policy"}, priority: 30},
+
+	"target_key_id": {childTypes: []string{"aws_kms_alias"}, priority: 30},
+	"key_id":        {childTypes: []string{"aws_kms_grant"}, priority: 30},
+
+	"table_name": {childTypes: []string{"aws_dynamodb_table_item", "aws_dynamodb_tag", "aws_dynamodb_kinesis_streaming_destination"}, priority: 30},
+
+	"distribution_id": {childTypes: []string{"aws_cloudfront_monitoring_subscription", "aws_cloudfront_origin_access_identity"}, priority: 30},
+
+	"domain_name": {childTypes: []string{"aws_elasticsearch_domain_policy", "aws_opensearch_domain_policy", "aws_opensearch_domain_saml_options"}, priority: 30},
+
+	"certificate_arn": {childTypes: []string{"aws_acm_certificate_validation", "aws_lb_listener_certificate"}, priority: 30},
+
+	"cluster_name": {childTypes: []string{"aws_eks_node_group", "aws_eks_addon", "aws_eks_fargate_profile", "aws_eks_identity_provider_config"}, priority: 30},
+
+	"project_name": {childTypes: []string{"aws_codebuild_webhook"}, priority: 30},
+
+	"secret_id": {childTypes: []string{"aws_secretsmanager_secret_version", "aws_secretsmanager_secret_policy", "aws_secretsmanager_secret_rotation"}, priority: 30},
+
+	"web_acl_id": {childTypes: []string{"aws_waf_web_acl_association", "aws_wafv2_web_acl_association", "aws_wafv2_web_acl_logging_configuration"}, priority: 30},
+
+	"state_machine_arn": {childTypes: []string{"aws_sfn_alias"}, priority: 30},
+
+	"event_bus_name": {childTypes: []string{"aws_cloudwatch_event_rule", "aws_cloudwatch_event_archive"}, priority: 30},
+	"rule":           {childTypes: []string{"aws_cloudwatch_event_target"}, priority: 20},
+
+	"stream_name": {childTypes: []string{"aws_kinesis_firehose_delivery_stream"}, priority: 30},
+
+	"zone_id": {childTypes: []string{"aws_route53_record"}, priority: 30},
+}
+
+func matchesChildType(resType string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, p := range patterns {
+		if strings.HasPrefix(resType, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildContainmentMap(config PlanConfiguration) map[string]string {
+	parentMap := map[string]string{}
+	outputMap := buildModuleOutputMap(config)
+	collectContainment(config.RootModule, "", nil, parentMap, outputMap)
+	return parentMap
+}
+
+func collectContainment(mod ConfigModule, modulePrefix string, varMap map[string]string, parentMap map[string]string, outputMap map[string]string) {
+	for _, res := range mod.Resources {
+		srcAddr := res.Address
+		if modulePrefix != "" {
+			srcAddr = modulePrefix + "." + res.Address
+		}
+
+		parent := findBestContainmentParent(res.Type, res.Expressions, modulePrefix, varMap)
+		if parent != "" && parent != srcAddr {
+			parentMap[srcAddr] = parent
+		}
+	}
+
+	for callName, call := range mod.ModuleCalls {
+		childPrefix := "module." + callName
+		if modulePrefix != "" {
+			childPrefix = modulePrefix + ".module." + callName
+		}
+		childVarMap := buildVarMap(call.Expressions, outputMap)
+		propagateParentVars(call.Expressions, varMap, childVarMap)
+		collectContainment(call.Module, childPrefix, childVarMap, parentMap, outputMap)
+	}
+}
+
+func findBestContainmentParent(resType string, exprs interface{}, modulePrefix string, varMap map[string]string) string {
+	bestParent := ""
+	bestPriority := 999
+	scanContainmentExpr(exprs, resType, modulePrefix, varMap, &bestParent, &bestPriority)
+	return bestParent
+}
+
+func scanContainmentExpr(v interface{}, resType, modulePrefix string, varMap map[string]string, bestParent *string, bestPriority *int) {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		for key, child := range val {
+			if def, ok := containmentKeys[key]; ok && def.priority < *bestPriority && matchesChildType(resType, def.childTypes) {
+				refs := getDirectRefs(child)
+				for _, ref := range refs {
+					resolved := resolveRef(ref, modulePrefix, varMap)
+					if resolved != "" && !isModuleOnlyPrefix(resolved) {
+						*bestParent = resolved
+						*bestPriority = def.priority
+						break
+					}
+				}
+			}
+			scanContainmentExpr(child, resType, modulePrefix, varMap, bestParent, bestPriority)
+		}
+	case []interface{}:
+		for _, child := range val {
+			scanContainmentExpr(child, resType, modulePrefix, varMap, bestParent, bestPriority)
+		}
+	}
+}
+
+func getDirectRefs(v interface{}) []string {
+	if m, ok := v.(map[string]interface{}); ok {
+		if refList, ok := m["references"]; ok {
+			if arr, ok := refList.([]interface{}); ok {
+				var refs []string
+				for _, item := range arr {
+					if s, ok := item.(string); ok {
+						refs = append(refs, s)
+					}
+				}
+				return refs
+			}
+		}
+	}
+	return nil
+}
+
+func collectAllPlannedResources(mod Module) []Resource {
+	var all []Resource
+	all = append(all, mod.Resources...)
+	for _, child := range mod.ChildModules {
+		all = append(all, collectAllPlannedResources(child)...)
+	}
+	return all
+}
+
+func enrichContainmentFromValues(planned []Resource, containment map[string]string) {
+	idToAddr := map[string]string{}
+	for _, res := range planned {
+		if id, ok := res.Values["id"].(string); ok && id != "" {
+			idToAddr[id] = stripIndex(res.Address)
+		}
+	}
+
+	for _, res := range planned {
+		addr := stripIndex(res.Address)
+		if _, hasParent := containment[addr]; hasParent {
+			continue
+		}
+		parent := findValueBasedParent(res.Values, idToAddr)
+		if parent != "" && parent != addr {
+			containment[addr] = parent
+		}
+	}
+}
+
+func findValueBasedParent(values map[string]interface{}, idToAddr map[string]string) string {
+	if sid, ok := values["subnet_id"].(string); ok && sid != "" {
+		if addr, ok := idToAddr[sid]; ok {
+			return addr
+		}
+	}
+	if parent := resolveFirstID(values, "subnet_ids", idToAddr); parent != "" {
+		return parent
+	}
+	if vpcConfigs, ok := values["vpc_config"].([]interface{}); ok && len(vpcConfigs) > 0 {
+		if config, ok := vpcConfigs[0].(map[string]interface{}); ok {
+			if parent := resolveFirstID(config, "subnet_ids", idToAddr); parent != "" {
+				return parent
+			}
+			if vid, ok := config["vpc_id"].(string); ok && vid != "" {
+				if addr, ok := idToAddr[vid]; ok {
+					return addr
+				}
+			}
+		}
+	}
+	if vid, ok := values["vpc_id"].(string); ok && vid != "" {
+		if addr, ok := idToAddr[vid]; ok {
+			return addr
+		}
+	}
+	return ""
+}
+
+func resolveFirstID(values map[string]interface{}, key string, idToAddr map[string]string) string {
+	ids, ok := values[key].([]interface{})
+	if !ok {
+		return ""
+	}
+	for _, id := range ids {
+		if sid, ok := id.(string); ok && sid != "" {
+			if addr, ok := idToAddr[sid]; ok {
+				return addr
+			}
+		}
+	}
+	return ""
+}
+
+func buildPlannedValuesMap(planned []Resource) map[string]map[string]interface{} {
+	m := map[string]map[string]interface{}{}
+	for _, res := range planned {
+		m[stripIndex(res.Address)] = res.Values
+	}
+	return m
+}
+
+func enrichNetworkLabel(label, resType string, values map[string]interface{}) string {
+	if values == nil {
+		return label
+	}
+	var extras []string
+	if nameTag := getNameTag(values); nameTag != "" {
+		extras = append(extras, nameTag)
+	}
+	if cidr, ok := values["cidr_block"].(string); ok && cidr != "" {
+		extras = append(extras, cidr)
+	}
+	if resType == "aws_subnet" {
+		if az, ok := values["availability_zone"].(string); ok && az != "" {
+			extras = append(extras, az)
+		}
+	}
+	if len(extras) > 0 {
+		label += "\n" + strings.Join(extras, " | ")
+	}
+	return label
+}
+
+func getNameTag(values map[string]interface{}) string {
+	tags, ok := values["tags"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	name, _ := tags["Name"].(string)
+	return name
+}
+
+func buildGraphJSON(analyzed AnalyzedPlan, refEdges map[string][]string, containment map[string]string, plannedValues map[string]map[string]interface{}) (string, string, error) {
 	type elem struct {
 		Data    map[string]interface{} `json:"data"`
 		Classes string                 `json:"classes,omitempty"`
@@ -558,52 +1083,155 @@ func buildGraphJSON(analyzed AnalyzedPlan) (string, string, error) {
 
 	elements := make([]elem, 0)
 	resourceDetails := map[string]ResourceAnalysis{}
+	knownNodes := map[string]bool{}
 
-	// add module nodes and resource nodes + edges
 	for _, m := range analyzed.Modules {
-		modID := "mod:" + m.Address
-		elements = append(elements, elem{
-			Data:    map[string]interface{}{"id": modID, "label": m.Address, "group": "module"},
-			Classes: "module",
-		})
-
 		for _, r := range m.Resources {
-			// resource node
 			rID := r.Address
-			label := r.Address
-			if r.Name != "" {
-				label = r.Name + " (" + r.Type + ")"
+			label := r.Name + "\n(" + r.Type + ")"
+			if r.Type == "aws_vpc" || r.Type == "aws_subnet" {
+				label = enrichNetworkLabel(label, r.Type, plannedValues[stripIndex(rID)])
 			}
 			classes := "resource"
 			if r.Action != "" {
-				classes = classes + " " + r.Action
+				classes += " " + r.Action
 			}
 
-			elements = append(elements, elem{
-				Data:    map[string]interface{}{"id": rID, "label": label, "type": r.Type, "action": r.Action},
-				Classes: classes,
-			})
-
-			// edge: module -> resource (containment)
-			eID := "edge:contains:" + modID + ":" + rID
-			elements = append(elements, elem{
-				Data: map[string]interface{}{"id": eID, "source": modID, "target": rID, "label": "contains"},
-			})
-
-			// add depends_on edges (resource -> resource)
-			for _, dep := range r.DependsOn {
-				// dep might be like "aws_instance.foo"; only add edge if dep exists as node later (cytoscape tolerates missing nodes)
-				edgeID := "edge:dep:" + dep + "->" + rID
-				elements = append(elements, elem{
-					Data: map[string]interface{}{"id": edgeID, "source": dep, "target": rID, "label": "depends_on"},
-				})
+			nodeData := map[string]interface{}{
+				"id":     rID,
+				"label":  label,
+				"type":   r.Type,
+				"action": r.Action,
+				"module": m.Address,
 			}
 
+			if parent, ok := containment[stripIndex(rID)]; ok {
+				nodeData["parent"] = parent
+			}
+
+			elements = append(elements, elem{Data: nodeData, Classes: classes})
+			knownNodes[rID] = true
 			resourceDetails[r.Address] = r
 		}
 	}
 
-	// produce JSON strings
+	for i := range elements {
+		parentID, hasParent := elements[i].Data["parent"]
+		if !hasParent {
+			continue
+		}
+		parentStr, _ := parentID.(string)
+		if knownNodes[parentStr] {
+			continue
+		}
+		cur := parentStr
+		visited := map[string]bool{cur: true}
+		found := false
+		for {
+			gp, ok := containment[cur]
+			if !ok || visited[gp] {
+				break
+			}
+			visited[gp] = true
+			if knownNodes[gp] {
+				elements[i].Data["parent"] = gp
+				found = true
+				break
+			}
+			cur = gp
+		}
+		if !found {
+			delete(elements[i].Data, "parent")
+		}
+	}
+
+	knownBase := map[string]bool{}
+	for id := range knownNodes {
+		knownBase[stripIndex(id)] = true
+	}
+
+	added := true
+	for added {
+		added = false
+		for child, parent := range containment {
+			if !knownNodes[child] && !knownBase[child] {
+				continue
+			}
+			if knownNodes[parent] {
+				continue
+			}
+			if knownBase[parent] {
+				continue
+			}
+			parts := strings.Split(parent, ".")
+			resType := ""
+			resName := ""
+			for i, p := range parts {
+				if strings.Contains(p, "_") && i+1 < len(parts) {
+					resType = p
+					resName = parts[i+1]
+					break
+				}
+			}
+			label := parent
+			if resType != "" {
+				label = resName + "\n(" + resType + ")"
+			} else if len(parts) >= 2 {
+				label = parts[len(parts)-1] + "\n(" + parts[len(parts)-2] + ")"
+			}
+			if resType == "aws_vpc" || resType == "aws_subnet" {
+				label = enrichNetworkLabel(label, resType, plannedValues[parent])
+			}
+			nodeData := map[string]interface{}{
+				"id":    parent,
+				"label": label,
+				"type":  resType,
+			}
+			if pp, ok := containment[parent]; ok {
+				nodeData["parent"] = pp
+			}
+			elements = append(elements, elem{Data: nodeData, Classes: "resource container"})
+			knownNodes[parent] = true
+			added = true
+		}
+	}
+
+	containmentPairs := map[string]bool{}
+	for child, parent := range containment {
+		containmentPairs[child+"->"+parent] = true
+	}
+
+	for src, targets := range refEdges {
+		for _, tgt := range targets {
+			if !knownNodes[src] || !knownNodes[tgt] {
+				continue
+			}
+			if containmentPairs[stripIndex(src)+"->"+stripIndex(tgt)] {
+				continue
+			}
+			edgeID := "edge:ref:" + src + "->" + tgt
+			elements = append(elements, elem{
+				Data:    map[string]interface{}{"id": edgeID, "source": src, "target": tgt},
+				Classes: "reference",
+			})
+		}
+	}
+
+	for _, m := range analyzed.Modules {
+		for _, r := range m.Resources {
+			for _, dep := range r.DependsOn {
+				if !knownNodes[dep] {
+					continue
+				}
+				edgeID := "edge:dep:" + dep + "->" + r.Address
+				elements = append(elements, elem{
+					Data:    map[string]interface{}{"id": edgeID, "source": dep, "target": r.Address},
+					Classes: "depends_on",
+				})
+			}
+		}
+	}
+
 	elJSON, err := json.Marshal(elements)
 	if err != nil {
 		return "", "", err
@@ -654,7 +1282,7 @@ func formatValue(v interface{}) string {
 		if err == nil {
 			return string(out)
 		}
-		return fmt.Sprintf("%v", v) // Fallback if JSON marshaling fails
+		return fmt.Sprintf("%v", v)
 	}
 
 	return fmt.Sprintf("%v", v)
@@ -672,8 +1300,8 @@ func formatJSON(s string) (string, bool) {
 	return string(out), true
 }
 
-func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
-	graphJSON, resourceDetailsJSON, _ := buildGraphJSON(analysis)
+func generateHTML(analysis AnalyzedPlan, showGraph bool, refEdges map[string][]string, containment map[string]string, plannedValues map[string]map[string]interface{}) string {
+	graphJSON, resourceDetailsJSON, _ := buildGraphJSON(analysis, refEdges, containment, plannedValues)
 	data := struct {
 		AnalyzedPlan
 		GraphJSON           template.JS
@@ -694,8 +1322,8 @@ func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Terraform Plan Analysis</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
-  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
-  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/elkjs@0.9.3/lib/elk.bundled.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape-elk@2.2.0/dist/cytoscape-elk.js"></script>
   <style>
     :root {
       --background-color: #f7f8fa;
@@ -792,9 +1420,80 @@ func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
     }
     #graph {
       width: 100%;
-      height: 500px;
+      height: 700px;
       border: 1px solid var(--border-color);
       margin-top: 20px;
+      background: #fafbfc;
+    }
+    .graph-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      padding: 10px 20px;
+      gap: 10px;
+      border-bottom: 1px solid var(--border-color);
+      flex-wrap: wrap;
+      background: var(--sidebar-bg);
+    }
+    .graph-toolbar-left {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+    .toolbar-group {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .toolbar-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-secondary-color);
+      white-space: nowrap;
+    }
+    .mod-btn {
+      padding: 3px 10px;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      background: #fff;
+      cursor: pointer;
+      font-size: 11px;
+      transition: all 0.15s;
+    }
+    .mod-btn.active {
+      background: var(--accent-color);
+      color: white;
+      border-color: var(--accent-color);
+    }
+    .mod-btn:hover { opacity: 0.8; }
+    .ctrl-btn {
+      padding: 3px 10px;
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      background: #fff;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .ctrl-btn:hover { background: #f0f0f0; }
+    .graph-legend {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: var(--text-secondary-color);
+    }
+    .legend-swatch {
+      width: 20px;
+      height: 10px;
+      border-radius: 2px;
     }
     .module {
       border-bottom: 1px solid var(--border-color);
@@ -909,6 +1608,28 @@ func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
     </div>
 
     {{if .ShowGraph}}
+    <div class="graph-toolbar">
+      <div class="graph-toolbar-left">
+        <div class="toolbar-group">
+          <span class="toolbar-label">Modules</span>
+          <div id="moduleFilters"></div>
+        </div>
+        <div class="toolbar-group">
+          <span class="toolbar-label">View</span>
+          <button class="ctrl-btn" onclick="expandAll()">Expand All</button>
+          <button class="ctrl-btn" onclick="collapseAll()">Collapse All</button>
+          <button class="ctrl-btn" onclick="cy.fit(null,50)">Fit</button>
+        </div>
+      </div>
+      <div class="graph-legend">
+        <div class="legend-item"><div class="legend-swatch" style="background:#28a745;opacity:0.15;border:2px dashed #28a745"></div>VPC</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#0366d6;opacity:0.15;border:2px dashed #0366d6"></div>Subnet</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#28a745"></div>Create</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#dbab09"></div>Update</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#d73a49"></div>Delete</div>
+        <div class="legend-item"><div class="legend-swatch" style="border-top:2px dashed #6f42c1;height:0"></div>Ref</div>
+      </div>
+    </div>
     <div id="graph"></div>
     {{end}}
 
@@ -944,43 +1665,212 @@ func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
   {{if .ShowGraph}}
   <script>
     const elements = {{.GraphJSON}};
+    const resourceDetails = {{.ResourceDetailsJSON}};
+
     const cy = cytoscape({
       container: document.getElementById('graph'),
       elements: elements,
-      layout: { 
-        name: 'dagre',
-        rankDir: 'TB',
-        spacingFactor: 1.2,
-        nodeSep: 40, 
-        edgeSep: 20,
-        rankSep: 50,
-       },
+      layout: {
+        name: 'elk',
+        elk: {
+          algorithm: 'layered',
+          'elk.direction': 'DOWN',
+          'elk.spacing.nodeNode': '35',
+          'elk.layered.spacing.nodeNodeBetweenLayers': '60',
+          'elk.padding': '[top=50,left=30,bottom=30,right=30]',
+          'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
+          'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
+          'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF'
+        },
+        fit: true,
+        padding: 50
+      },
       style: [
-        { selector: 'node', style: {
+        { selector: ':parent', style: {
             'label': 'data(label)',
-			'width': 'label',    
-            'height': 'label',    
-            'padding': '12px',    
+            'text-valign': 'top',
+            'text-halign': 'center',
+            'text-margin-y': '10px',
+            'font-size': '13px',
+            'font-weight': 'bold',
+            'color': '#333',
+            'text-wrap': 'wrap',
+            'text-max-width': '250px',
+            'background-opacity': 0.07,
+            'border-width': 2,
+            'border-style': 'dashed',
+            'padding': '30px',
+            'shape': 'round-rectangle',
+            'background-color': '#888',
+            'border-color': '#888'
+        }},
+        { selector: ':parent[type = "aws_vpc"]', style: {
+            'background-color': '#28a745',
+            'border-color': '#28a745',
+            'color': '#1a6d2e'
+        }},
+        { selector: ':parent[type = "aws_subnet"]', style: {
+            'background-color': '#0366d6',
+            'border-color': '#0366d6',
+            'color': '#0550ae'
+        }},
+        { selector: '.cy-collapsed', style: {
+            'background-opacity': 0.15,
+            'border-style': 'solid'
+        }},
+
+        { selector: 'node:childless', style: {
+            'label': 'data(label)',
+            'width': 'label',
+            'height': 'label',
+            'padding': '12px',
             'text-valign': 'center',
+            'text-halign': 'center',
             'color': '#fff',
             'text-outline-width': 2,
             'text-outline-color': '#555',
             'background-color': '#555',
+            'shape': 'round-rectangle',
             'text-wrap': 'wrap',
-            'text-max-width': '80px'
+            'text-max-width': '130px',
+            'font-size': '10px',
+            'border-width': 1,
+            'border-color': '#fff',
+            'border-opacity': 0.3
         }},
-        { selector: 'node.create', style: { 'background-color': '#28a745' }},
-        { selector: 'node.update', style: { 'background-color': '#dbab09' }},
-        { selector: 'node.delete', style: { 'background-color': '#d73a49' }},
-        { selector: 'node.module', style: { 'background-color': '#0366d6', 'shape': 'round-rectangle' }},
+        { selector: 'node.create:childless', style: { 'background-color': '#28a745', 'text-outline-color': '#1a6d2e' }},
+        { selector: 'node.update:childless', style: { 'background-color': '#dbab09', 'text-outline-color': '#8a6d00' }},
+        { selector: 'node.delete:childless', style: { 'background-color': '#d73a49', 'text-outline-color': '#9e1c23' }},
+        { selector: 'node.container:childless', style: { 'background-color': '#6a737d', 'text-outline-color': '#444d56' }},
+
         { selector: 'edge', style: {
-            'width': 2,
-            'line-color': '#ccc',
-            'target-arrow-color': '#ccc',
+            'width': 1.5,
+            'line-color': '#bbb',
+            'target-arrow-color': '#bbb',
             'target-arrow-shape': 'triangle',
-            'curve-style': 'bezier'
-        }}
+            'curve-style': 'bezier',
+            'opacity': 0.6
+        }},
+        { selector: 'edge.reference', style: {
+            'line-color': '#6f42c1',
+            'target-arrow-color': '#6f42c1',
+            'line-style': 'dashed'
+        }},
+        { selector: 'edge.depends_on', style: {
+            'line-color': '#e36209',
+            'target-arrow-color': '#e36209',
+            'line-style': 'dotted'
+        }},
+        { selector: '.faded', style: { 'opacity': 0.12 }},
+        { selector: '.highlighted', style: { 'opacity': 1 }}
       ]
+    });
+
+    /* ── Collapse / Expand ── */
+    function collapseNode(node) {
+      const desc = node.descendants();
+      const leafCount = desc.filter(':childless').length;
+      node.data('_origLabel', node.data('label'));
+      node.data('label', node.data('label').split('\n')[0] + '\n[' + leafCount + ' resources]');
+      desc.addClass('cy-hidden');
+      desc.style('display', 'none');
+      desc.connectedEdges().style('display', 'none');
+      node.addClass('cy-collapsed');
+    }
+
+    function expandNode(node) {
+      if (!node.hasClass('cy-collapsed')) return;
+      node.data('label', node.data('_origLabel') || node.data('label'));
+      node.descendants().forEach(function(d) {
+        if (!hiddenModules.has(d.data('module'))) {
+          d.removeClass('cy-hidden');
+          d.style('display', 'element');
+        }
+      });
+      node.descendants().connectedEdges().forEach(function(e) {
+        const s = e.source(), t = e.target();
+        if (s.style('display') !== 'none' && t.style('display') !== 'none') {
+          e.style('display', 'element');
+        }
+      });
+      node.removeClass('cy-collapsed');
+      node.descendants(':parent.cy-collapsed').forEach(function(child) {
+        expandNode(child);
+      });
+    }
+
+    cy.on('tap', ':parent', function(evt) {
+      evt.stopPropagation();
+      const node = evt.target;
+      if (node.hasClass('cy-collapsed')) { expandNode(node); } else { collapseNode(node); }
+    });
+
+    function expandAll() {
+      cy.nodes(':parent.cy-collapsed').forEach(function(n) { expandNode(n); });
+    }
+    function collapseAll() {
+      cy.nodes(':parent').roots().forEach(function(n) { collapseNode(n); });
+    }
+
+    /* ── Module Filter ── */
+    const hiddenModules = new Set();
+    const moduleSet = new Set();
+    elements.forEach(function(e) {
+      if (e.data && e.data.module) moduleSet.add(e.data.module);
+    });
+
+    const mfDiv = document.getElementById('moduleFilters');
+    const sorted = Array.from(moduleSet).sort();
+    sorted.forEach(function(mod) {
+      const btn = document.createElement('button');
+      btn.className = 'mod-btn active';
+      btn.textContent = mod;
+      btn.onclick = function() {
+        if (hiddenModules.has(mod)) {
+          hiddenModules.delete(mod);
+          btn.classList.add('active');
+        } else {
+          hiddenModules.add(mod);
+          btn.classList.remove('active');
+        }
+        applyModuleFilter();
+      };
+      mfDiv.appendChild(btn);
+    });
+
+    function applyModuleFilter() {
+      cy.nodes('[module]').forEach(function(node) {
+        if (hiddenModules.has(node.data('module'))) {
+          node.style('display', 'none');
+          node.connectedEdges().style('display', 'none');
+        } else {
+          node.style('display', 'element');
+        }
+      });
+      cy.edges().forEach(function(e) {
+        const s = e.source(), t = e.target();
+        if (s.style('display') !== 'none' && t.style('display') !== 'none') {
+          e.style('display', 'element');
+        } else {
+          e.style('display', 'none');
+        }
+      });
+      cy.nodes(':parent').forEach(function(p) {
+        const vis = p.children().filter(function(c) { return c.style('display') !== 'none'; });
+        if (vis.length === 0) { p.style('display', 'none'); } else { p.style('display', 'element'); }
+      });
+    }
+
+    /* ── Highlight neighbors on leaf tap ── */
+    cy.on('tap', 'node:childless', function(evt) {
+      cy.elements().removeClass('faded highlighted');
+      const n = evt.target;
+      const hood = n.neighborhood().add(n);
+      cy.elements().not(hood).not(':parent').addClass('faded');
+      hood.addClass('highlighted');
+    });
+    cy.on('tap', function(evt) {
+      if (evt.target === cy) cy.elements().removeClass('faded highlighted');
     });
   </script>
   {{end}}
@@ -1009,7 +1899,7 @@ func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
         resources.forEach(resource => {
           const address = resource.querySelector('h3').textContent.toLowerCase();
           const type = resource.querySelector('p').textContent.toLowerCase();
-          const action = resource.querySelector('.action-icon').classList[1]; // e.g., "create", "update"
+          const action = resource.querySelector('.action-icon').classList[1];
 
           const matchesSearch = address.includes(filterText) || type.includes(filterText) || action.includes(filterText);
           const matchesAction = filterAction === 'all' || action === filterAction;
@@ -1022,7 +1912,6 @@ func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
           }
         });
 
-        // Show/hide module header based on whether it has visible resources
         if (moduleHasVisibleResources) {
           module.style.display = '';
         } else {
@@ -1035,7 +1924,7 @@ func generateHTML(analysis AnalyzedPlan, showGraph bool) string {
       const filterButtons = document.querySelectorAll('.filter-btn');
       filterButtons.forEach(btn => btn.classList.remove('active'));
       clickedButton.classList.add('active');
-      filterResources(); // Re-run filter with new action
+      filterResources();
     }
   </script>
 </body>
