@@ -55,6 +55,8 @@ To see a dependency graph of your resources, use the `--graph` or `-g` flag:
 ```bash
 tfviz plan --graph
 ```
+<img width="1207" height="764" alt="image" src="https://github.com/user-attachments/assets/fb45fa69-b25b-4809-ad1c-83cc92d03e8f" />
+
 
 No HTML file is written to disk — everything runs in memory.
   
